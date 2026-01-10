@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 ### Configuration de la base de donnees
 ```bash
-cp .env.example > .env
+cp .env.example .env
 ```
 
 ## injection des donnees geographiques du cameroun dans la base de donnees
@@ -40,6 +40,9 @@ cp .env.example > .env
 python3 ingest_data.py
 ```
 
-
 ## Demarrage de l'api
+```bash
+python3 app.py
 
+# demarrage sur le port 5000
+```
