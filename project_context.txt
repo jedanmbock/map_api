@@ -1,0 +1,1254 @@
+Project Context From: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api
+Generated On: Fri, Feb  6, 2026 11:52:18 AM
+===============================================
+Ignored Directory Patterns: .* node_modules vendor build dist target __pycache__ .next cache target venv storage
+Ignored File Patterns: *.log *.jar *.pdf *.png *.jpg *.class *.sqlite *.csv project_context.txt package-lock.json yarn.lock composer.lock *.ico pnpm-lock.yaml
+===============================================
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/.env
+
+# Database configuration
+DB_USER=DB_USER
+DB_PASSWORD=DB_PASSWORD
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=DB_NAME
+// END OF FILE: .env
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/.env.example
+
+# Database configuration
+DB_USER=DB_USER
+DB_PASSWORD=DB_PASSWORD
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=DB_NAME
+// END OF FILE: .env.example
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/.gitignore
+
+.env
+venv/
+__pycache__/
+*.pyc
+instance/
+.venv/
+// END OF FILE: .gitignore
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/app.py
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+def get_db_connection():
+    conn = psycopg2.connect(
+        host=os.getenv('DB_HOST'),
+        database=os.getenv('DB_NAME'),
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        port=os.getenv('DB_PORT')
+    )
+    return conn
+
+# ... [Les routes existantes get_zones, get_filters, get_map_data restent identiques] ...
+# Je remets get_zones et get_filters pour la complétude, suivi des nouvelles routes.
+
+@app.route('/api/gis/zones', methods=['GET'])
+def get_zones():
+    level = request.args.get('level', 'REGION').upper()
+    parent_id = request.args.get('parent_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        query = "SELECT id, name, level, parent_id, code, ST_AsGeoJSON(geometry)::json as geometry FROM administrative_zones WHERE level = %s"
+        params = [level]
+        if parent_id and parent_id != 'null' and parent_id != 'undefined':
+            query += " AND parent_id = %s"
+            params.append(str(parent_id))
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        features = []
+        for row in rows:
+            features.append({
+                "type": "Feature",
+                "properties": row,
+                "geometry": row['geometry']
+            })
+        return jsonify({"type": "FeatureCollection", "features": features})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/filters', methods=['GET'])
+def get_filters():
+    parent_id = request.args.get('parent_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if not parent_id or parent_id == 'null' or parent_id == 'undefined':
+            where_clause = "1=1"
+            params = []
+        else:
+            where_clause = """
+                ps.zone_code IN (
+                    WITH RECURSIVE zone_tree AS (
+                        SELECT code, id FROM administrative_zones WHERE id = %s
+                        UNION ALL
+                        SELECT az.code, az.id FROM administrative_zones az
+                        JOIN zone_tree zt ON az.parent_id = zt.id::text
+                    )
+                    SELECT code FROM zone_tree
+                )
+            """
+            params = [int(parent_id)]
+        query = f"""
+            SELECT DISTINCT ss.id, ss.name, ss.color, s.name as category
+            FROM sub_sectors ss
+            JOIN sectors s ON ss.sector_id = s.id
+            JOIN production_stats ps ON ps.sub_sector_id = ss.id
+            WHERE {where_clause}
+            ORDER BY s.name, ss.name
+        """
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        grouped = {}
+        for row in rows:
+            cat = row['category']
+            if cat not in grouped: grouped[cat] = []
+            grouped[cat].append(row)
+        return jsonify(grouped)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/map/data', methods=['GET'])
+def get_map_data():
+    sub_sector_id = request.args.get('sector_id')
+    level = request.args.get('level', 'REGION').upper()
+    parent_id = request.args.get('parent_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT ss.name, ss.color, s.name as category FROM sub_sectors ss JOIN sectors s ON ss.sector_id = s.id WHERE ss.id = %s", (sub_sector_id,))
+        sector_info = cur.fetchone()
+
+        zones_query = "SELECT id, name, level, parent_id, code, ST_AsGeoJSON(geometry)::json as geometry FROM administrative_zones WHERE level = %s"
+        zones_params = [level]
+        if parent_id and parent_id != 'null' and parent_id != 'undefined':
+            zones_query += " AND parent_id = %s"
+            zones_params.append(str(parent_id))
+        cur.execute(zones_query, zones_params)
+        zones = cur.fetchall()
+
+        features = []
+        total_global_volume = 0
+        global_unit = ""
+
+        for zone in zones:
+            stats_query = """
+                WITH RECURSIVE zone_descendants AS (
+                    SELECT code, id FROM administrative_zones WHERE id = %s
+                    UNION ALL
+                    SELECT az.code, az.id FROM administrative_zones az
+                    JOIN zone_descendants zd ON az.parent_id = zd.id::text
+                )
+                SELECT SUM(volume) as total, MAX(unit) as unit
+                FROM production_stats
+                WHERE sub_sector_id = %s AND zone_code IN (SELECT code FROM zone_descendants)
+            """
+            cur.execute(stats_query, (zone['id'], sub_sector_id))
+            stat = cur.fetchone()
+            vol = float(stat['total']) if stat and stat['total'] else 0
+            unit = stat['unit'] if stat and stat['unit'] else ""
+            if unit: global_unit = unit
+            total_global_volume += vol
+
+            features.append({
+                "type": "Feature",
+                "properties": {**zone, "value": vol, "unit": unit},
+                "geometry": zone['geometry']
+            })
+
+        return jsonify({
+            "geojson": { "type": "FeatureCollection", "features": features },
+            "stats": { "total": total_global_volume, "unit": global_unit },
+            "sector": sector_info
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/zone/stats', methods=['GET'])
+def get_zone_stats():
+    zone_id = request.args.get('zone_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        query = """
+            WITH RECURSIVE zone_tree AS (
+                SELECT code, id FROM administrative_zones WHERE id = %s
+                UNION ALL
+                SELECT az.code, az.id FROM administrative_zones az
+                JOIN zone_tree zt ON az.parent_id = zt.id::text
+            )
+            SELECT ss.name as sector, s.name as category, SUM(ps.volume) as volume, MAX(ps.unit) as unit
+            FROM production_stats ps
+            JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
+            JOIN sectors s ON ss.sector_id = s.id
+            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
+            GROUP BY ss.name, s.name
+            ORDER BY volume DESC
+        """
+        cur.execute(query, (int(zone_id),))
+        rows = cur.fetchall()
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+# --- NOUVELLES ROUTES POUR LE PANNEAU DROIT ---
+
+@app.route('/api/stats/global', methods=['GET'])
+def get_global_zone_stats():
+    """Stats globales d'une zone (Top productions, Total producteurs)"""
+    zone_id = request.args.get('zone_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Top 5 productions
+        query_top = """
+            WITH RECURSIVE zone_tree AS (
+                SELECT code, id FROM administrative_zones WHERE id = %s
+                UNION ALL
+                SELECT az.code, az.id FROM administrative_zones az
+                JOIN zone_tree zt ON az.parent_id = zt.id::text
+            )
+            SELECT ss.name, SUM(ps.volume) as volume, MAX(ps.unit) as unit
+            FROM production_stats ps
+            JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
+            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
+            GROUP BY ss.name
+            ORDER BY volume DESC
+            LIMIT 5
+        """
+        cur.execute(query_top, (int(zone_id),))
+        top_products = cur.fetchall()
+
+        # Total producteurs
+        query_producers = """
+            WITH RECURSIVE zone_tree AS (
+                SELECT code, id FROM administrative_zones WHERE id = %s
+                UNION ALL
+                SELECT az.code, az.id FROM administrative_zones az
+                JOIN zone_tree zt ON az.parent_id = zt.id::text
+            )
+            SELECT SUM(producer_count) as total_producers
+            FROM production_stats ps
+            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
+        """
+        cur.execute(query_producers, (int(zone_id),))
+        producers = cur.fetchone()
+
+        return jsonify({
+            "top_products": top_products,
+            "total_producers": producers['total_producers'] if producers else 0
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/stats/evolution', methods=['GET'])
+def get_evolution_stats():
+    """Evolution temporelle (2021-2024) pour les top produits de la zone"""
+    zone_id = request.args.get('zone_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        query = """
+            WITH RECURSIVE zone_tree AS (
+                SELECT code, id FROM administrative_zones WHERE id = %s
+                UNION ALL
+                SELECT az.code, az.id FROM administrative_zones az
+                JOIN zone_tree zt ON az.parent_id = zt.id::text
+            )
+            SELECT ps.year, ss.name as sector, SUM(ps.volume) as volume
+            FROM production_stats ps
+            JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
+            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
+            AND ps.year BETWEEN 2021 AND 2024
+            GROUP BY ps.year, ss.name
+            ORDER BY ps.year ASC
+        """
+        cur.execute(query, (int(zone_id),))
+        rows = cur.fetchall()
+
+        # Restructuration pour le frontend (Recharts)
+        # { year: 2021, Cacao: 100, Coton: 200 }
+        data_by_year = {}
+        sectors = set()
+        for row in rows:
+            year = row['year']
+            if year not in data_by_year: data_by_year[year] = {"year": year}
+            data_by_year[year][row['sector']] = float(row['volume'])
+            sectors.add(row['sector'])
+
+        return jsonify({"data": list(data_by_year.values()), "sectors": list(sectors)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+@app.route('/api/stats/comparison', methods=['GET'])
+def get_comparison_stats():
+    """Comparaison des enfants directs (ex: Départements d'une Région)"""
+    zone_id = request.args.get('zone_id')
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Trouver les enfants directs
+        query = """
+            SELECT id, name, code FROM administrative_zones WHERE parent_id = %s
+        """
+        cur.execute(query, (str(zone_id),))
+        children = cur.fetchall()
+
+        comparison_data = []
+
+        for child in children:
+            # Somme totale de production pour cet enfant (toutes filières confondues - attention aux unités différentes,
+            # idéalement on filtre par filière principale, ici on fait une somme globale brute pour l'exemple ou on prend le top produit)
+
+            # Pour l'exemple, on prend le volume total du produit le plus important de la zone parente
+            # 1. Trouver le top produit de la zone parente
+            cur.execute("""
+                WITH RECURSIVE zone_tree AS (
+                    SELECT code, id FROM administrative_zones WHERE id = %s
+                    UNION ALL
+                    SELECT az.code, az.id FROM administrative_zones az
+                    JOIN zone_tree zt ON az.parent_id = zt.id::text
+                )
+                SELECT sub_sector_id FROM production_stats ps
+                WHERE zone_code IN (SELECT code FROM zone_tree)
+                GROUP BY sub_sector_id ORDER BY SUM(volume) DESC LIMIT 1
+            """, (int(zone_id),))
+            top_sector = cur.fetchone()
+
+            if top_sector:
+                sid = top_sector['sub_sector_id']
+                # 2. Calculer le volume de ce produit pour l'enfant (récursif)
+                cur.execute("""
+                    WITH RECURSIVE child_tree AS (
+                        SELECT code, id FROM administrative_zones WHERE id = %s
+                        UNION ALL
+                        SELECT az.code, az.id FROM administrative_zones az
+                        JOIN child_tree zt ON az.parent_id = zt.id::text
+                    )
+                    SELECT SUM(volume) as total FROM production_stats
+                    WHERE sub_sector_id = %s AND zone_code IN (SELECT code FROM child_tree)
+                """, (child['id'], sid))
+                res = cur.fetchone()
+                vol = float(res['total']) if res and res['total'] else 0
+                comparison_data.append({"name": child['name'], "value": vol})
+
+        return jsonify(comparison_data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+// END OF FILE: app.py
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/generate_full_data.py
+
+import csv
+import random
+import os
+
+# --- 1. STRUCTURE ADMINISTRATIVE (Région -> Départements -> Arrondissements) ---
+# Pour alléger le script, je mets les principaux. Le script générera des données pour eux.
+ADMIN_STRUCTURE = {
+    "Adamaoua": {
+        "code": "CM001",
+        "depts": {
+            "Djérem": ["Tibati", "Ngaoundal"],
+            "Faro-et-Déo": ["Tignère", "Galim-Tignère"],
+            "Mayo-Banyo": ["Banyo", "Bankim"],
+            "Mbéré": ["Meiganga", "Djohong"],
+            "Vina": ["Ngaoundéré I", "Ngaoundéré II", "Ngaoundéré III", "Belel"]
+        }
+    },
+    "Centre": {
+        "code": "CM002",
+        "depts": {
+            "Haute-Sanaga": ["Nanga-Eboko", "Minta"],
+            "Lekié": ["Monatélé", "Obala", "Sa'a", "Ebebda", "Okola"],
+            "Mbam-et-Inoubou": ["Bafia", "Bokito", "Ombessa"],
+            "Mbam-et-Kim": ["Ntui", "Ngambé-Tikar"],
+            "Mefou-et-Afamba": ["Mfou", "Awaé"],
+            "Mefou-et-Akono": ["Ngoumou", "Akono"],
+            "Mfoundi": ["Yaoundé I", "Yaoundé II", "Yaoundé III", "Yaoundé IV"],
+            "Nyong-et-Kéllé": ["Eséka", "Makak"],
+            "Nyong-et-Mfoumou": ["Akonolinga", "Endom"],
+            "Nyong-et-So'o": ["Mbalmayo", "Ngomedzap"]
+        }
+    },
+    "Est": {
+        "code": "CM003",
+        "depts": {
+            "Boumba-et-Ngoko": ["Yokadouma", "Gari-Gombo"],
+            "Haut-Nyong": ["Abong-Mbang", "Doumaintang", "Lomié"],
+            "Kadey": ["Batouri", "Kette"],
+            "Lom-et-Djérem": ["Bertoua I", "Bertoua II", "Garoua-Boulaï"]
+        }
+    },
+    "Extrême-Nord": {
+        "code": "CM004",
+        "depts": {
+            "Diamaré": ["Maroua I", "Maroua II", "Maroua III", "Gazawa"],
+            "Logone-et-Chari": ["Kousseri", "Makary"],
+            "Mayo-Danay": ["Yagoua", "Kaélé"],
+            "Mayo-Kani": ["Kaélé", "Guidiguis"],
+            "Mayo-Sava": ["Mora", "Tokombéré"],
+            "Mayo-Tsanaga": ["Mokolo", "Bourha"]
+        }
+    },
+    "Littoral": {
+        "code": "CM005",
+        "depts": {
+            "Moungo": ["Nkongsamba I", "Mbanga", "Njombé-Penja", "Loum"],
+            "Nkam": ["Yabassi", "Yingui"],
+            "Sanaga-Maritime": ["Edéa I", "Dizangué", "Mouanko"],
+            "Wouri": ["Douala I", "Douala II", "Douala III", "Douala IV", "Manoka"]
+        }
+    },
+    "Nord": {
+        "code": "CM006",
+        "depts": {
+            "Bénoué": ["Garoua I", "Garoua II", "Lagdo", "Bibemi", "Pitoa"],
+            "Faro": ["Poli", "Beka"],
+            "Mayo-Louti": ["Guider", "Figuil"],
+            "Mayo-Rey": ["Tcholliré", "Touboro"]
+        }
+    },
+    "Nord-Ouest": {
+        "code": "CM007",
+        "depts": {
+            "Boyo": ["Fundong"],
+            "Bui": ["Kumbo", "Jakiri"],
+            "Donga-Mantung": ["Nkambé"],
+            "Menchum": ["Wum"],
+            "Mezam": ["Bamenda I", "Bamenda II", "Santa", "Bali"],
+            "Momo": ["Mbengwi"],
+            "Ngo-Ketunjia": ["Ndop"]
+        }
+    },
+    "Ouest": {
+        "code": "CM008",
+        "depts": {
+            "Bamboutos": ["Mbouda", "Galim", "Batcham"],
+            "Haut-Nkam": ["Bafang", "Bana"],
+            "Hauts-Plateaux": ["Baham"],
+            "Koung-Khi": ["Bandjoun"],
+            "Menoua": ["Dschang", "Santchou", "Nkong-Ni"],
+            "Mifi": ["Bafoussam I", "Bafoussam II"],
+            "Ndé": ["Bangangté"],
+            "Noun": ["Foumban", "Foumbot", "Koutaba"]
+        }
+    },
+    "Sud": {
+        "code": "CM009",
+        "depts": {
+            "Dja-et-Lobo": ["Sangmélima", "Djoum"],
+            "Mvila": ["Ebolowa I", "Ebolowa II", "Mengong"],
+            "Océan": ["Kribi I", "Kribi II", "Campo", "Lolodorf"],
+            "Vallée-du-Ntem": ["Ambam", "Kyé-Ossi"]
+        }
+    },
+    "Sud-Ouest": {
+        "code": "CM010",
+        "depts": {
+            "Fako": ["Limbe I", "Limbe II", "Buea", "Tiko", "Muyuka"],
+            "Koupé-Manengouba": ["Bangem"],
+            "Lebialem": ["Menji"],
+            "Manyu": ["Mamfé"],
+            "Meme": ["Kumba I", "Kumba II", "Mbonge"],
+            "Ndian": ["Mundemba"]
+        }
+    }
+}
+
+# --- 2. CONFIGURATION DES FILIÈRES ---
+# (Secteur, Sous-secteur, Unité, Prix Base, Rendement Base, Régions de prédilection)
+FILIERES = [
+    # AGRICULTURE
+    ("Agriculture", "Cacao", "Tonnes", 1500, 0.5, ["Centre", "Sud", "Est", "Sud-Ouest", "Littoral"]),
+    ("Agriculture", "Café", "Tonnes", 1200, 0.4, ["Ouest", "Nord-Ouest", "Est", "Littoral", "Centre"]),
+    ("Agriculture", "Coton", "Tonnes", 350, 1.2, ["Extrême-Nord", "Nord", "Adamaoua"]),
+    ("Agriculture", "Maïs", "Tonnes", 250, 2.5, ["Ouest", "Nord-Ouest", "Adamaoua", "Centre", "Nord", "Extrême-Nord"]),
+    ("Agriculture", "Manioc", "Tonnes", 150, 12.0, ["Centre", "Sud", "Est", "Littoral", "Adamaoua", "Sud-Ouest"]),
+    ("Agriculture", "Banane", "Tonnes", 200, 15.0, ["Sud-Ouest", "Littoral", "Ouest", "Centre"]),
+    ("Agriculture", "Pomme de terre", "Tonnes", 400, 10.0, ["Ouest", "Nord-Ouest", "Adamaoua"]),
+    ("Agriculture", "Riz", "Tonnes", 450, 3.0, ["Extrême-Nord", "Nord", "Nord-Ouest", "Ouest"]),
+    ("Agriculture", "Sorgho", "Tonnes", 200, 1.5, ["Extrême-Nord", "Nord", "Adamaoua"]),
+    ("Agriculture", "Oignon", "Tonnes", 300, 15.0, ["Nord", "Extrême-Nord"]),
+    ("Agriculture", "Arachide", "Tonnes", 500, 1.2, ["Nord", "Extrême-Nord", "Centre", "Est", "Adamaoua"]),
+    ("Agriculture", "Palmier à huile", "Tonnes", 90, 8.0, ["Littoral", "Sud-Ouest", "Centre", "Sud"]),
+    ("Agriculture", "Hévéa", "Tonnes", 600, 1.5, ["Sud", "Littoral", "Sud-Ouest"]),
+    ("Agriculture", "Ananas", "Tonnes", 150, 20.0, ["Centre", "Littoral"]),
+
+    # ELEVAGE
+    ("Elevage", "Bovins", "Têtes", 400000, 0, ["Adamaoua", "Nord", "Extrême-Nord", "Nord-Ouest", "Est"]),
+    ("Elevage", "Volailles", "Têtes", 3500, 0, ["Ouest", "Centre", "Littoral", "Nord-Ouest", "Sud-Ouest"]),
+    ("Elevage", "Porcins", "Têtes", 50000, 0, ["Ouest", "Centre", "Littoral", "Sud", "Nord-Ouest"]),
+    ("Elevage", "Petits Ruminants", "Têtes", 40000, 0, ["Extrême-Nord", "Nord", "Adamaoua", "Nord-Ouest"]),
+
+    # PECHE
+    ("Peche", "Pêche Maritime", "Tonnes", 2000, 0, ["Littoral", "Sud", "Sud-Ouest"]),
+    ("Peche", "Pêche Continentale", "Tonnes", 1500, 0, ["Nord", "Extrême-Nord", "Centre", "Est"]),
+    ("Peche", "Aquaculture", "Tonnes", 2500, 0, ["Ouest", "Centre", "Littoral", "Nord-Ouest"]),
+]
+
+YEARS = [2021, 2022, 2023, 2024]
+
+def generate_pcode(parent_code, index):
+    """Génère un code unique basé sur le parent"""
+    return f"{parent_code}{index:02d}"
+
+def generate_full_dataset():
+    data_rows = []
+    header = ["year", "pcode", "zone_name", "level", "parent_pcode", "sector", "sub_sector", "volume", "unit", "surface_area", "yield", "producer_count", "average_price", "description"]
+
+    # 1. Construction de la liste des zones à plat
+    zones_list = [] # (pcode, name, level, parent_pcode, region_name)
+
+    # PAYS
+    zones_list.append(("CMR", "Cameroun", "COUNTRY", "", "Cameroun"))
+
+    for reg_name, reg_data in ADMIN_STRUCTURE.items():
+        reg_code = reg_data["code"]
+        zones_list.append((reg_code, reg_name, "REGION", "CMR", reg_name))
+
+        dept_index = 1
+        for dept_name, arros in reg_data["depts"].items():
+            dept_code = generate_pcode(reg_code, dept_index)
+            zones_list.append((dept_code, dept_name, "DEPARTEMENT", reg_code, reg_name))
+
+            arro_index = 1
+            for arro_name in arros:
+                arro_code = generate_pcode(dept_code, arro_index)
+                zones_list.append((arro_code, arro_name, "ARRONDISSEMENT", dept_code, reg_name))
+                arro_index += 1
+
+            dept_index += 1
+
+    print(f"Structure géographique générée : {len(zones_list)} zones.")
+    print("Génération des statistiques de production...")
+
+    # 2. Génération des données
+    for year in YEARS:
+        for pcode, name, level, parent_pcode, region_name in zones_list:
+
+            for sector, sub_sector, unit, base_price, base_yield, regions_predilection in FILIERES:
+
+                # RÈGLE D'OR : On ne génère une ligne QUE si la région est une zone de production
+                # pour cette filière. Sinon, on passe (pas de ligne à 0).
+
+                is_production_zone = False
+
+                # Le pays produit tout
+                if level == "COUNTRY":
+                    is_production_zone = True
+                # Pour les régions/départements/arrondissements, on vérifie la liste de prédilection
+                elif region_name in regions_predilection:
+                    is_production_zone = True
+
+                if not is_production_zone:
+                    continue # On saute cette itération, donc pas de ligne dans le CSV
+
+                # Calcul des volumes (décroissant selon le niveau)
+                base_vol = 0
+                if level == "COUNTRY": base_vol = 500000
+                elif level == "REGION": base_vol = 80000
+                elif level == "DEPARTEMENT": base_vol = 15000
+                elif level == "ARRONDISSEMENT": base_vol = 3000
+
+                # Facteurs de variation
+                year_factor = 1.0
+                if year == 2022: year_factor = 1.05
+                if year == 2023: year_factor = 0.90
+                if year == 2024: year_factor = 1.15
+
+                random_factor = random.uniform(0.7, 1.3) # Variation locale
+
+                volume = int(base_vol * year_factor * random_factor)
+
+                # Sécurité : pas de volume négatif ou nul si c'est une zone de production
+                if volume <= 0: volume = 100
+
+                # Calculs dérivés
+                surface = 0
+                yield_val = 0
+                if base_yield > 0:
+                    yield_val = round(base_yield * random.uniform(0.9, 1.1), 2)
+                    surface = int(volume / yield_val)
+
+                price = int(base_price * year_factor * random.uniform(0.95, 1.05))
+
+                prod_ratio = 2 if unit == "Tonnes" else 10
+                producer_count = int(volume / prod_ratio * random.uniform(0.8, 1.2))
+                if producer_count < 10: producer_count = 10
+
+                desc = f"Production de {sub_sector} en {year}"
+
+                data_rows.append([
+                    year, pcode, name, level, parent_pcode,
+                    sector, sub_sector, volume, unit,
+                    surface, yield_val, producer_count, price, desc
+                ])
+
+    # Écriture du CSV
+    os.makedirs("data", exist_ok=True)
+    file_path = "data/production_data.csv"
+    with open(file_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(data_rows)
+
+    print(f"✅ Fichier généré : {file_path} ({len(data_rows)} lignes)")
+    print("Vous pouvez maintenant lancer 'python3 seed_data.py'")
+
+if __name__ == "__main__":
+    generate_full_dataset()
+// END OF FILE: generate_full_data.py
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/ingest_data.py
+
+import os
+import geopandas as gpd
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+from shapely.geometry import Polygon, MultiPolygon
+
+load_dotenv()
+
+user = os.getenv("DB_USER")
+password = os.getenv("DB_PASSWORD")
+host = os.getenv("DB_HOST")
+port = os.getenv("DB_PORT")
+db_name = os.getenv("DB_NAME")
+
+DB_URL = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+engine = create_engine(DB_URL)
+
+def reset_database():
+    print("--- 🧹 Nettoyage ---")
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS administrative_zones CASCADE;"))
+        conn.execute(text("DROP TABLE IF EXISTS temp_departements;"))
+        conn.execute(text("DROP TABLE IF EXISTS temp_arrondissements;"))
+        conn.commit()
+
+def prepare_gdf(gdf):
+    if gdf.crs is None: gdf = gdf.set_crs("EPSG:4326")
+    else: gdf = gdf.to_crs("EPSG:4326")
+
+    def force_multi(geom):
+        return MultiPolygon([geom]) if isinstance(geom, Polygon) else geom
+
+    gdf["geometry"] = gdf["geometry"].apply(force_multi)
+    return gdf
+
+def ingest_all():
+    try:
+        # 1. PAYS
+        print("--- 1. Pays ---")
+        gdf_0 = gpd.read_file("shapes/gadm41_CMR_0.shp")
+        gdf_0 = prepare_gdf(gdf_0)
+        col_0 = 'COUNTRY' if 'COUNTRY' in gdf_0.columns else 'NAME_0'
+        gdf_0 = gdf_0.rename(columns={col_0: 'name'})[['name', 'geometry']]
+        gdf_0['level'] = 'COUNTRY'
+        gdf_0['parent_id'] = None
+        gdf_0.to_postgis('administrative_zones', engine, if_exists='replace', index=False)
+
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE administrative_zones ADD COLUMN id SERIAL PRIMARY KEY;"))
+            conn.commit()
+
+        # 2. REGIONS
+        print("--- 2. Régions ---")
+        with engine.connect() as conn:
+            cid = conn.execute(text("SELECT id FROM administrative_zones WHERE level='COUNTRY' LIMIT 1")).scalar()
+
+        gdf_1 = gpd.read_file("shapes/gadm41_CMR_1.shp")
+        gdf_1 = prepare_gdf(gdf_1)
+        gdf_1 = gdf_1.rename(columns={'NAME_1': 'name'})[['name', 'geometry']]
+        gdf_1['level'] = 'REGION'
+        gdf_1['parent_id'] = cid
+        gdf_1.to_postgis('administrative_zones', engine, if_exists='append', index=False)
+
+        # 3. DEPARTEMENTS (Liaison robuste avec LOWER())
+        print("--- 3. Départements ---")
+        gdf_2 = gpd.read_file("shapes/gadm41_CMR_2.shp")
+        gdf_2 = prepare_gdf(gdf_2)
+        gdf_2 = gdf_2.rename(columns={'NAME_2': 'name', 'NAME_1': 'p_name'})[['name', 'p_name', 'geometry']]
+        gdf_2['level'] = 'DEPARTEMENT'
+        gdf_2.to_postgis('temp_departements', engine, if_exists='replace')
+
+        with engine.connect() as conn:
+            # On utilise LOWER() et TRIM() pour être sûr que "CENTRE" matche avec "Centre"
+            conn.execute(text("""
+                INSERT INTO administrative_zones (name, level, geometry, parent_id)
+                SELECT t.name, 'DEPARTEMENT', t.geometry, p.id
+                FROM temp_departements t
+                JOIN administrative_zones p ON LOWER(TRIM(t.p_name)) = LOWER(TRIM(p.name))
+                WHERE p.level = 'REGION'
+            """))
+            conn.commit()
+
+        # 4. ARRONDISSEMENTS (Liaison robuste avec LOWER())
+        print("--- 4. Arrondissements ---")
+        gdf_3 = gpd.read_file("shapes/gadm41_CMR_3.shp")
+        gdf_3 = prepare_gdf(gdf_3)
+        gdf_3 = gdf_3.rename(columns={'NAME_3': 'name', 'NAME_2': 'p_name'})[['name', 'p_name', 'geometry']]
+        gdf_3['level'] = 'ARRONDISSEMENT'
+        gdf_3.to_postgis('temp_arrondissements', engine, if_exists='replace')
+
+        with engine.connect() as conn:
+            # On utilise LOWER() et TRIM() pour être sûr que "MFOUNDI" matche avec "Mfoundi"
+            conn.execute(text("""
+                INSERT INTO administrative_zones (name, level, geometry, parent_id)
+                SELECT t.name, 'ARRONDISSEMENT', t.geometry, p.id
+                FROM temp_arrondissements t
+                JOIN administrative_zones p ON LOWER(TRIM(t.p_name)) = LOWER(TRIM(p.name))
+                WHERE p.level = 'DEPARTEMENT'
+            """))
+            conn.commit()
+
+            # Vérification du nombre d'arrondissements insérés
+            count = conn.execute(text("SELECT count(*) FROM administrative_zones WHERE level='ARRONDISSEMENT'")).scalar()
+            print(f"✅ {count} Arrondissements insérés avec succès !")
+
+            conn.execute(text("DROP TABLE temp_departements; DROP TABLE temp_arrondissements;"))
+
+    except Exception as e:
+        print(f"❌ Erreur : {e}")
+
+if __name__ == "__main__":
+    reset_database()
+    ingest_all()
+// END OF FILE: ingest_data.py
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/prompter.sh
+
+#!/bin/bash
+
+# --- Configuration ---
+
+# Default project path if none provided
+DEFAULT_PROJECT_PATH="."
+PROJECT_PATH=${1:-"$DEFAULT_PROJECT_PATH"}
+
+# Output file name (relative to PROJECT_PATH)
+OUTPUT_FILENAME="project_context.txt"
+
+# Directories to completely ignore (won't be traversed)
+EXCLUDE_DIRS_PATTERN=( \
+    ".*"            # All hidden folders (.git, .vscode, .idea, .svn, etc.)
+    "node_modules"
+    "vendor"        # PHP Composer
+    "build"
+    "dist"
+    "target"        # Java/Rust build outputs
+    "__pycache__"   # Python cache
+    ".next"         # Next.js build output
+    "cache"         # General cache folders
+    "target"
+    "venv"
+    "storage"       # Laravel storage (often contains logs, cache, etc.)
+    # Add more directory names here if needed
+)
+
+# Specific file patterns to ignore within traversed directories
+EXCLUDE_FILES_PATTERN=( \
+    "*.log"
+    "*.jar"
+    "*.pdf"
+    "*.png"
+    "*.jpg"
+    "*.class"
+    "*.sqlite"
+    "*.csv"
+    "project_context.txt"
+    # ".env*"       # Consider if you NEED .env files; uncomment if NOT needed.
+    "package-lock.json"
+    "yarn.lock"
+    "composer.lock"
+    "*.ico"
+    "pnpm-lock.yaml"
+    # Add more file patterns here (e.g., "*.swp", "*.bak", "*.tmp")
+)
+
+# --- Script Logic ---
+
+# Attempt to get absolute path; exit if PROJECT_PATH is invalid early
+PROJECT_PATH=$(realpath "$PROJECT_PATH" 2>/dev/null)
+if [ $? -ne 0 ] || [ ! -d "$PROJECT_PATH" ]; then
+    echo "Error: Invalid or non-existent project directory specified." >&2 # Error to stderr
+    exit 1
+fi
+
+OUTPUT_FILE="$PROJECT_PATH/$OUTPUT_FILENAME"
+
+# --- Safety Check: Prevent overwriting the project directory itself ---
+# This is unlikely but guards against strange configurations
+if [ "$PROJECT_PATH" == "$OUTPUT_FILE" ]; then
+    echo "Error: Project directory path conflicts with output file name '$OUTPUT_FILENAME'." >&2
+    exit 1
+fi
+
+# Delete output file silently if it exists
+rm -f "$OUTPUT_FILE"
+
+# --- Build the find command ---
+# Uses arrays to construct the find command safely and avoid complex escaping issues with eval
+find_args=("$PROJECT_PATH")
+
+# Add directory prune conditions
+if [ ${#EXCLUDE_DIRS_PATTERN[@]} -gt 0 ]; then
+    find_args+=(\()
+    first_prune=true
+    for dir_pattern in "${EXCLUDE_DIRS_PATTERN[@]}"; do
+        if ! $first_prune; then
+            find_args+=(-o)
+        fi
+        find_args+=(-name "$dir_pattern" -type d)
+        first_prune=false
+    done
+    find_args+=(\) -prune -o) # Add the prune action and the OR for the next part
+fi
+
+# Add primary find conditions (type file, exclude output file, exclude patterns)
+find_args+=(\( -type f -not -path "$OUTPUT_FILE")
+if [ ${#EXCLUDE_FILES_PATTERN[@]} -gt 0 ]; then
+    for file_pattern in "${EXCLUDE_FILES_PATTERN[@]}"; do
+        find_args+=(-not -name "$file_pattern")
+    done
+fi
+find_args+=(-print \)) # Add the print action and close the group
+
+# --- Execute the find command and process results ---
+
+# Create the header in the output file
+{
+    echo "Project Context From: $PROJECT_PATH"
+    echo "Generated On: $(date)"
+    echo "==============================================="
+    echo "Ignored Directory Patterns: ${EXCLUDE_DIRS_PATTERN[*]}"
+    echo "Ignored File Patterns: ${EXCLUDE_FILES_PATTERN[*]}"
+    echo "==============================================="
+    echo ""
+} > "$OUTPUT_FILE"
+
+error_count=0
+# Use find with process substitution and sorting. Avoids eval.
+while IFS= read -r FILE_PATH; do
+    # Calculate relative path for cleaner output
+    RELATIVE_PATH="${FILE_PATH#"$PROJECT_PATH"/}"
+
+    # Append file info and content to the output file
+    {
+        # echo ""
+        # echo "// ==============================================="
+        # echo "---> FILE: $RELATIVE_PATH"
+        echo "//---> PATH: $FILE_PATH"
+        # echo "// ==============================================="
+        echo ""
+    } >> "$OUTPUT_FILE"
+
+    # Check if file is likely binary/non-text using 'file' command
+    # -b: omit filename; check for common non-text types
+    if file -b "$FILE_PATH" | grep -q -E 'binary|archive|compressed|image|font'; then
+        echo "[Non-text file (e.g., binary, data, compressed) - Contents omitted]" >> "$OUTPUT_FILE"
+    else
+        # Append text file content, redirect cat errors to stderr
+        if ! cat "$FILE_PATH" >> "$OUTPUT_FILE" 2> /dev/null; then # Hide cat errors from stdout
+             # Optionally log error to the output file itself, or just count it
+             echo "[Error reading file content for $RELATIVE_PATH]" >> "$OUTPUT_FILE"
+             ((error_count++))
+        fi
+    fi
+
+    {
+        # echo ""
+        echo "// END OF FILE: $RELATIVE_PATH"
+        echo ""
+    } >> "$OUTPUT_FILE"
+
+done < <(find "${find_args[@]}" | sort) # Execute find command using safe array expansion
+
+# Optionally report errors to stderr if any occurred
+if [ $error_count -gt 0 ]; then
+    echo "Warning: Encountered $error_count errors reading file contents during context generation." >&2
+    # Exit with a non-zero status to indicate partial success/warning
+    exit 1
+fi
+
+# Exit silently on success
+exit 0
+// END OF FILE: prompter.sh
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/README.md
+
+# api pour la gestion des donnees cartographiques du projet
+
+## Configuration du projet
+
+### Acces au projet
+
+```bash
+git clone 
+
+cd map_api
+```
+
+### creation et activation de l'environnement virtuel
+```bash
+python3 -m venv venv
+
+# Activation sous linux
+source venv/bin/activate
+
+# Activation sous Windows
+venv\Scripts\Activate
+
+# Desactiver
+deactivate
+```
+
+### Installation des dependances du projet
+
+```bash
+pip install -r requirements.txt
+```
+
+### Configuration de la base de donnees
+```bash
+cp .env.example .env
+```
+
+## Demarrage de l'api
+```bash
+python3 app.py
+
+# demarrage sur le port 5000
+```
+// END OF FILE: README.md
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/requirements.txt
+
+blinker==1.9.0
+certifi==2026.1.4
+click==8.3.1
+Flask==3.0.0
+Flask-Cors==4.0.0
+GeoAlchemy2==0.18.1
+geopandas==1.1.2
+greenlet==3.3.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+numpy==2.4.0
+packaging==25.0
+pandas==2.3.3
+psycopg2-binary==2.9.11
+pyogrio==0.12.1
+pyproj==3.7.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.1
+pytz==2025.2
+shapely==2.1.2
+six==1.17.0
+SQLAlchemy==2.0.45
+typing_extensions==4.15.0
+tzdata==2025.3
+Werkzeug==3.1.5
+// END OF FILE: requirements.txt
+
+//---> PATH: /c/Users/hp/Documents/5GI_presentiel/Semestre1/Traitement d'images SIG et Webmapping/map_api/seed_data.py
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration DB
+DB_URL = f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+engine = create_engine(DB_URL)
+
+# Couleurs pour l'affichage sur la carte
+COLORS = {
+    'Cacao': '#8B4513', 'Café': '#6F4E37', 'Coton': '#ECF0F1', 'Maïs': '#F1C40F',
+    'Manioc': '#2ECC71', 'Banane': '#F39C12', 'Pomme de terre': '#D35400',
+    'Bovins': '#E74C3C', 'Volailles': '#E91E63', 'Porcins': '#FF99CC', 'Petits Ruminants': '#A52A2A',
+    'Pêche Maritime': '#3498DB', 'Pêche Fluviale': '#1ABC9C', 'Pêche Continentale': '#2980B9', 'Pêche Indu./Artisa.': '#5DADE2',
+    'Riz': '#95A5A6', 'Igname': '#D4AC0D', 'Oignon': '#E67E22', 'Palmier à huile': '#808000', 'Aquaculture': '#00CED1',
+    'Hévéa': '#2E8B57', 'Ananas': '#FFD700'
+}
+
+# Mapping pour corriger les différences de noms entre CSV et DB PostGIS
+NAME_MAPPING = {
+    "Extreme-Nord": "Extrême-Nord",
+    "Adamaoua": "Adamaoua",
+    "Centre": "Centre",
+    "Est": "Est",
+    "Littoral": "Littoral",
+    "Nord": "Nord",
+    "Nord-Ouest": "Nord-Ouest",
+    "Ouest": "Ouest",
+    "Sud": "Sud",
+    "Sud-Ouest": "Sud-Ouest",
+    "Lekié": "Lekie",
+    "Mbam-et-Inoubou": "Mbam-Et-Inoubou",
+    "Bénoué": "Benoue",
+    "Mfoundi": "Mfoundi",
+    "Vina": "Vina",
+    "Mbéré": "Mbere",
+    "Djérem": "Djerem",
+    "Haute-Sanaga": "Haute-Sanaga",
+    "Nyong-et-So'o": "Nyong-Et-So'o",
+    "Kadey": "Kadey",
+    "Lom-et-Djérem": "Lom-Et-Djerem",
+    "Diamaré": "Diamare",
+    "Logone-et-Chari": "Logone-Et-Chari",
+    "Mayo-Danay": "Mayo-Danay",
+    "Wouri": "Wouri",
+    "Sanaga-Maritime": "Sanaga-Maritime",
+    "Moungo": "Moungo",
+    "Mayo-Rey": "Mayo-Rey",
+    "Mezam": "Mezam",
+    "Bui": "Bui",
+    "Bamboutos": "Bamboutos",
+    "Mifi": "Mifi",
+    "Menoua": "Menoua",
+    "Dja-et-Lobo": "Dja-Et-Lobo",
+    "Océan": "Ocean",
+    "Vallée-du-Ntem": "Vallee-Du-Ntem",
+    "Fako": "Fako",
+    "Meme": "Meme",
+    # Arrondissements (Exemples)
+    "Obala": "Obala",
+    "Monatélé": "Monatele",
+    "Sa'a": "Sa'a",
+    "Bafia": "Bafia",
+    "Bokito": "Bokito",
+    "Garoua I": "Garoua I",
+    "Lagdo": "Lagdo",
+    "Bibemi": "Bibemi",
+    "Yaoundé I": "Yaounde I",
+    "Yaoundé II": "Yaounde II",
+    "Yaoundé III": "Yaounde III",
+    "Ngaoundéré I": "Ngaoundere I",
+    "Ngaoundéré II": "Ngaoundere II",
+    "Meiganga": "Meiganga",
+    "Bertoua I": "Bertoua I",
+    "Garoua-Boulaï": "Garoua-Boulai",
+    "Maroua I": "Maroua I",
+    "Gazawa": "Gazawa",
+    "Douala IV": "Douala IV",
+    "Manoka": "Manoka",
+    "Njombé-Penja": "Njombe-Penja",
+    "Bafoussam I": "Bafoussam I",
+    "Mbouda": "Mbouda",
+    "Galim": "Galim",
+    "Kribi I": "Kribi I",
+    "Campo": "Campo"
+}
+
+def update_table_structure():
+    """Met à jour la structure de la table production_stats pour ajouter les nouvelles colonnes"""
+    with engine.connect() as conn:
+        print("--- Mise à jour de la structure de la base de données ---")
+
+        # 1. Ajouter les colonnes si elles n'existent pas
+        columns_to_add = [
+            ("surface_area", "numeric(15,2)"),
+            ("yield", "numeric(10,2)"),
+            ("producer_count", "integer"),
+            ("average_price", "numeric(15,2)"),
+            ("year", "integer DEFAULT 2023")
+        ]
+
+        for col_name, col_type in columns_to_add:
+            try:
+                conn.execute(text(f"ALTER TABLE production_stats ADD COLUMN IF NOT EXISTS {col_name} {col_type}"))
+            except Exception:
+                pass
+
+        # 2. Mettre à jour la contrainte d'unicité pour inclure l'année
+        try:
+            conn.execute(text("ALTER TABLE production_stats DROP CONSTRAINT IF EXISTS unique_production_entry"))
+            conn.execute(text("ALTER TABLE production_stats ADD CONSTRAINT unique_production_entry UNIQUE (sub_sector_id, zone_code, year)"))
+        except Exception as e:
+            print(f"Info contrainte: {e}")
+
+        conn.commit()
+        print("✅ Structure de la table vérifiée.")
+
+def seed_database():
+    # D'abord, on met à jour la structure
+    update_table_structure()
+
+    csv_path = "./data/production_data.csv"
+    if not os.path.exists(csv_path):
+        print(f"❌ Erreur: Fichier {csv_path} introuvable. Lancez 'python3 generate_full_data.py' d'abord.")
+        return
+
+    print("Lecture du fichier CSV...")
+    df = pd.read_csv(csv_path)
+
+    # Remplacer les valeurs NaN
+    df = df.fillna({
+        'surface_area': 0, 'yield': 0, 'producer_count': 0,
+        'average_price': 0, 'description': '', 'parent_pcode': ''
+    })
+
+    with engine.connect() as conn:
+        print("--- 1. Nettoyage des tables de statistiques ---")
+        conn.execute(text("TRUNCATE production_stats, sub_sectors, sectors RESTART IDENTITY CASCADE;"))
+
+        print("--- 2. Synchronisation des Zones Géographiques ---")
+
+        processed_zones = set()
+
+        # Récupération des IDs existants
+        existing_zones = pd.read_sql("SELECT code, id FROM administrative_zones", conn)
+        zone_id_map = dict(zip(existing_zones['code'], existing_zones['id']))
+
+        # On parcourt le CSV pour mettre à jour les zones
+        for _, row in df.iterrows():
+            pcode = row['pcode']
+            if pcode in processed_zones: continue
+
+            zone_name = row['zone_name']
+            level = row['level']
+            parent_pcode = row['parent_pcode']
+            db_name = NAME_MAPPING.get(zone_name, zone_name)
+
+            # Trouver l'ID du parent
+            parent_id = None
+            if parent_pcode and parent_pcode in zone_id_map:
+                parent_id = zone_id_map[parent_pcode]
+
+            # Mise à jour de la zone (Code, Level, Parent)
+            res = conn.execute(text("""
+                UPDATE administrative_zones
+                SET code = :code, level = :level, parent_id = :pid
+                WHERE code = :code OR name ILIKE :name OR name ILIKE :mapped_name
+            """), {
+                "code": pcode,
+                "level": level,
+                "pid": str(parent_id) if parent_id else None,
+                "name": zone_name,
+                "mapped_name": db_name
+            })
+
+            processed_zones.add(pcode)
+
+        print("--- 3. Insertion des Secteurs & Sous-Secteurs ---")
+        unique_sectors = df['sector'].unique()
+        sector_map = {}
+
+        for sec_name in unique_sectors:
+            res = conn.execute(text("INSERT INTO sectors (name) VALUES (:name) ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name RETURNING id"), {"name": sec_name})
+            sector_map[sec_name] = res.fetchone()[0]
+
+        unique_subs = df[['sector', 'sub_sector']].drop_duplicates()
+        sub_sector_map = {}
+
+        for _, row in unique_subs.iterrows():
+            sec_name = row['sector']
+            sub_name = row['sub_sector']
+            color = COLORS.get(sub_name, '#7F8C8D')
+
+            res = conn.execute(
+                text("""
+                    INSERT INTO sub_sectors (sector_id, name, color)
+                    VALUES (:sid, :name, :color)
+                    ON CONFLICT (sector_id, name) DO UPDATE SET color=EXCLUDED.color
+                    RETURNING id
+                """),
+                {"sid": sector_map[sec_name], "name": sub_name, "color": color}
+            )
+            sub_sector_map[(sec_name, sub_name)] = res.fetchone()[0]
+
+        print(f"--- 4. Insertion des Statistiques ({len(df)} lignes) ---")
+
+        data_to_insert = []
+        for _, row in df.iterrows():
+            sub_id = sub_sector_map.get((row['sector'], row['sub_sector']))
+            if sub_id:
+                data_to_insert.append({
+                    "sid": sub_id,
+                    "code": row['pcode'],
+                    "vol": row['volume'],
+                    "unit": row['unit'],
+                    "desc": row['description'],
+                    "year": row['year'],
+                    "surf": row['surface_area'],
+                    "yield": row['yield'],
+                    "prod_count": row['producer_count'],
+                    "price": row['average_price']
+                })
+
+        if data_to_insert:
+            # Insertion par lot (batch)
+            conn.execute(
+                text("""
+                    INSERT INTO production_stats (
+                        sub_sector_id, zone_code, volume, unit, description, year,
+                        surface_area, yield, producer_count, average_price
+                    )
+                    VALUES (:sid, :code, :vol, :unit, :desc, :year, :surf, :yield, :prod_count, :price)
+                    ON CONFLICT (sub_sector_id, zone_code, year)
+                    DO UPDATE SET
+                        volume = EXCLUDED.volume,
+                        description = EXCLUDED.description,
+                        surface_area = EXCLUDED.surface_area,
+                        yield = EXCLUDED.yield,
+                        producer_count = EXCLUDED.producer_count,
+                        average_price = EXCLUDED.average_price
+                """),
+                data_to_insert
+            )
+
+        conn.commit()
+        print(f"✅ Terminé ! Base de données peuplée avec succès.")
+
+if __name__ == "__main__":
+    seed_database()
+// END OF FILE: seed_data.py
