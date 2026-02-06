@@ -35,21 +35,6 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-## injection des donnees geographiques du cameroun dans la base de donnees
-```bash
-python3 ingest_data.py
-```
-
-## Generation des donnees associer au bassin de production
-```bash 
-python3 generate_full_data.py
-```
-
-## Injection des donnees des bassins de production dans la base de donnees 
-```bash
-python3 seed_data.py
-```
-
 ## Demarrage de l'api
 ```bash
 python3 app.py
