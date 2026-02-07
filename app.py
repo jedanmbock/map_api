@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 CORS(app)
 
 def get_db_connection():
@@ -16,8 +17,10 @@ def get_db_connection():
         database=os.getenv('DB_NAME'),
         user=os.getenv('DB_USER'),
         password=os.getenv('DB_PASSWORD'),
-        port=os.getenv('DB_PORT')
+        port=os.getenv('DB_PORT'),
+        client_encoding='utf8'
     )
+    conn.set_client_encoding('UTF8')
     return conn
 
 # ... [Les routes existantes get_zones, get_filters, get_map_data restent identiques] ...
@@ -186,57 +189,6 @@ def get_zone_stats():
 
 # --- NOUVELLES ROUTES POUR LE PANNEAU DROIT ---
 
-@app.route('/api/stats/global', methods=['GET'])
-def get_global_zone_stats():
-    """Stats globales d'une zone (Top productions, Total producteurs)"""
-    zone_id = request.args.get('zone_id')
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        # Top 5 productions
-        query_top = """
-            WITH RECURSIVE zone_tree AS (
-                SELECT code, id FROM administrative_zones WHERE id = %s
-                UNION ALL
-                SELECT az.code, az.id FROM administrative_zones az
-                JOIN zone_tree zt ON az.parent_id = zt.id::text
-            )
-            SELECT ss.name, SUM(ps.volume) as volume, MAX(ps.unit) as unit
-            FROM production_stats ps
-            JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
-            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
-            GROUP BY ss.name
-            ORDER BY volume DESC
-            LIMIT 5
-        """
-        cur.execute(query_top, (int(zone_id),))
-        top_products = cur.fetchall()
-
-        # Total producteurs
-        query_producers = """
-            WITH RECURSIVE zone_tree AS (
-                SELECT code, id FROM administrative_zones WHERE id = %s
-                UNION ALL
-                SELECT az.code, az.id FROM administrative_zones az
-                JOIN zone_tree zt ON az.parent_id = zt.id::text
-            )
-            SELECT SUM(producer_count) as total_producers
-            FROM production_stats ps
-            WHERE ps.zone_code IN (SELECT code FROM zone_tree)
-        """
-        cur.execute(query_producers, (int(zone_id),))
-        producers = cur.fetchone()
-
-        return jsonify({
-            "top_products": top_products,
-            "total_producers": producers['total_producers'] if producers else 0
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        cur.close()
-        conn.close()
-
 @app.route('/api/stats/evolution', methods=['GET'])
 def get_evolution_stats():
     """Evolution temporelle (2021-2024) pour les top produits de la zone"""
@@ -338,5 +290,69 @@ def get_comparison_stats():
         cur.close()
         conn.close()
 
+@app.route('/api/stats/global', methods=['GET'])
+def get_global_zone_stats():
+    """Stats globales d'une zone (Nom, Top productions, Total producteurs, Volume total)"""
+    zone_id = request.args.get('zone_id')
+    if not zone_id:
+        return jsonify({"error": "zone_id is required"}), 400
+        
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Récupérer le nom et le niveau de la zone
+        cur.execute("SELECT name, level FROM administrative_zones WHERE id = %s", (int(zone_id),))
+        zone_info = cur.fetchone()
+
+        # 2. Top 5 productions (Requête corrigée)
+        top_products_query = """
+            SELECT ss.name, SUM(ps.volume) as volume, MAX(ps.unit) as unit
+            FROM production_stats ps
+            JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
+            WHERE ps.zone_code IN (
+                 WITH RECURSIVE zone_tree AS (
+                    SELECT code, id FROM administrative_zones WHERE id = %s
+                    UNION ALL
+                    SELECT az.code, az.id FROM administrative_zones az
+                    JOIN zone_tree zt ON az.parent_id = zt.id::text
+                ) SELECT code FROM zone_tree
+            )
+            GROUP BY ss.name
+            ORDER BY volume DESC
+            LIMIT 5
+        """
+        cur.execute(top_products_query, (int(zone_id),))
+        top_products = cur.fetchall()
+
+        # 3. Calcul du volume total et des producteurs
+        totals_query = """
+            SELECT SUM(ps.volume) as total_volume, SUM(ps.producer_count) as total_producers
+            FROM production_stats ps
+            WHERE ps.zone_code IN (
+                WITH RECURSIVE zone_tree AS (
+                    SELECT code, id FROM administrative_zones WHERE id = %s
+                    UNION ALL
+                    SELECT az.code, az.id FROM administrative_zones az
+                    JOIN zone_tree zt ON az.parent_id = zt.id::text
+                ) SELECT code FROM zone_tree
+            )
+        """
+        cur.execute(totals_query, (int(zone_id),))
+        totals = cur.fetchone()
+
+        return jsonify({
+            "zone_name": zone_info['name'] if zone_info else 'N/A',
+            "zone_level": zone_info['level'] if zone_info else 'N/A',
+            "top_products": top_products,
+            "total_producers": int(totals['total_producers']) if totals and totals['total_producers'] else 0,
+            "total_volume": float(totals['total_volume']) if totals and totals['total_volume'] else 0
+        })
+    except Exception as e:
+        app.logger.error(f"Erreur stats/global: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+        
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

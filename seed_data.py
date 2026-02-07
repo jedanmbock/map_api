@@ -128,7 +128,7 @@ def seed_database():
         return
 
     print("Lecture du fichier CSV...")
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding='utf-8')
 
     # Remplacer les valeurs NaN
     df = df.fillna({

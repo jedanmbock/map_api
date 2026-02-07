@@ -37,7 +37,7 @@ def ingest_all():
     try:
         # 1. PAYS
         print("--- 1. Pays ---")
-        gdf_0 = gpd.read_file("shapes/gadm41_CMR_0.shp")
+        gdf_0 = gpd.read_file("shapes/gadm41_CMR_0.shp", encoding="utf-8")
         gdf_0 = prepare_gdf(gdf_0)
         col_0 = 'COUNTRY' if 'COUNTRY' in gdf_0.columns else 'NAME_0'
         gdf_0 = gdf_0.rename(columns={col_0: 'name'})[['name', 'geometry']]
@@ -54,7 +54,7 @@ def ingest_all():
         with engine.connect() as conn:
             cid = conn.execute(text("SELECT id FROM administrative_zones WHERE level='COUNTRY' LIMIT 1")).scalar()
 
-        gdf_1 = gpd.read_file("shapes/gadm41_CMR_1.shp")
+        gdf_1 = gpd.read_file("shapes/gadm41_CMR_1.shp", encoding="utf-8")
         gdf_1 = prepare_gdf(gdf_1)
         gdf_1 = gdf_1.rename(columns={'NAME_1': 'name'})[['name', 'geometry']]
         gdf_1['level'] = 'REGION'
@@ -63,7 +63,7 @@ def ingest_all():
 
         # 3. DEPARTEMENTS (Liaison robuste avec LOWER())
         print("--- 3. Départements ---")
-        gdf_2 = gpd.read_file("shapes/gadm41_CMR_2.shp")
+        gdf_2 = gpd.read_file("shapes/gadm41_CMR_2.shp", encoding="utf-8")
         gdf_2 = prepare_gdf(gdf_2)
         gdf_2 = gdf_2.rename(columns={'NAME_2': 'name', 'NAME_1': 'p_name'})[['name', 'p_name', 'geometry']]
         gdf_2['level'] = 'DEPARTEMENT'
@@ -82,7 +82,7 @@ def ingest_all():
 
         # 4. ARRONDISSEMENTS (Liaison robuste avec LOWER())
         print("--- 4. Arrondissements ---")
-        gdf_3 = gpd.read_file("shapes/gadm41_CMR_3.shp")
+        gdf_3 = gpd.read_file("shapes/gadm41_CMR_3.shp", encoding="utf-8")
         gdf_3 = prepare_gdf(gdf_3)
         gdf_3 = gdf_3.rename(columns={'NAME_3': 'name', 'NAME_2': 'p_name'})[['name', 'p_name', 'geometry']]
         gdf_3['level'] = 'ARRONDISSEMENT'
