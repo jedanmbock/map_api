@@ -191,8 +191,9 @@ def get_zone_stats():
 
 @app.route('/api/stats/evolution', methods=['GET'])
 def get_evolution_stats():
-    """Evolution temporelle (2021-2024) pour les top produits de la zone"""
+    """Evolution temporelle pour les top produits de la zone (Toutes années confondues)"""
     zone_id = request.args.get('zone_id')
+    
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
@@ -207,30 +208,34 @@ def get_evolution_stats():
             FROM production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
             WHERE ps.zone_code IN (SELECT code FROM zone_tree)
-            AND ps.year BETWEEN 2021 AND 2024
+            -- SUPPRESSION DE LA RESTRICTION D'ANNÉE ICI :
+            -- AND ps.year BETWEEN 2021 AND 2024  <-- A ENLEVER
             GROUP BY ps.year, ss.name
             ORDER BY ps.year ASC
         """
         cur.execute(query, (int(zone_id),))
         rows = cur.fetchall()
 
-        # Restructuration pour le frontend (Recharts)
-        # { year: 2021, Cacao: 100, Coton: 200 }
+        # Restructuration pour le frontend
         data_by_year = {}
         sectors = set()
+        
+        # On s'assure que les années sont bien des entiers
         for row in rows:
-            year = row['year']
+            year = int(row['year']) 
             if year not in data_by_year: data_by_year[year] = {"year": year}
             data_by_year[year][row['sector']] = float(row['volume'])
             sectors.add(row['sector'])
 
-        return jsonify({"data": list(data_by_year.values()), "sectors": list(sectors)})
+        # Conversion en liste triée par année
+        sorted_data = sorted(list(data_by_year.values()), key=lambda x: x['year'])
+
+        return jsonify({"data": sorted_data, "sectors": list(sectors)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
         conn.close()
-
 @app.route('/api/stats/comparison', methods=['GET'])
 def get_comparison_stats():
     """Comparaison des enfants directs (ex: Départements d'une Région)"""
