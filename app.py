@@ -4,11 +4,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import os
 from dotenv import load_dotenv
+from flask_compress import Compress
 
 load_dotenv()
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
+Compress(app)
 CORS(app)
 
 def get_db_connection():
@@ -146,11 +148,13 @@ def get_map_data():
                 "geometry": zone['geometry']
             })
 
-        return jsonify({
+        response = jsonify({
             "geojson": { "type": "FeatureCollection", "features": features },
             "stats": { "total": total_global_volume, "unit": global_unit },
             "sector": sector_info
         })
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -180,7 +184,9 @@ def get_zone_stats():
         """
         cur.execute(query, (int(zone_id),))
         rows = cur.fetchall()
-        return jsonify(rows)
+        response = jsonify(rows)
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -234,11 +240,13 @@ def get_evolution_stats():
 
         sorted_data = sorted(list(data_by_year.values()), key=lambda x: x['year'])
 
-        return jsonify({
+        response = jsonify({
             "data": sorted_data, 
             "sectors": list(sectors),
             "categories": categories_map # On renvoie ce mapping au frontend
         })
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -297,7 +305,9 @@ def get_comparison_stats():
                 vol = float(res['total']) if res and res['total'] else 0
                 comparison_data.append({"name": child['name'], "value": vol})
 
-        return jsonify(comparison_data)
+        response = jsonify(comparison_data)
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -366,13 +376,15 @@ def get_global_zone_stats():
         cur.execute(totals_query, params_total)
         totals = cur.fetchone()
 
-        return jsonify({
+        response = jsonify({
             "zone_name": zone_info['name'] if zone_info else 'N/A',
             "zone_level": zone_info['level'] if zone_info else 'N/A',
             "top_products": all_products, # On garde la clé "top_products" pour pas casser le frontend, mais elle contient TOUT
             "total_volume": float(totals['total_volume']) if totals and totals['total_volume'] else 0
             # On a retiré total_producers
         })
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         app.logger.error(f"Erreur stats/global: {e}")
         return jsonify({"error": str(e)}), 500
@@ -401,7 +413,9 @@ def search_zones():
         search_pattern = f"%{query}%"
         cur.execute(sql, (search_pattern,))
         results = cur.fetchall()
-        return jsonify(results)
+        response = jsonify(results)
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
