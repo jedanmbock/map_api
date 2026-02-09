@@ -297,20 +297,28 @@ def get_comparison_stats():
 
 @app.route('/api/stats/global', methods=['GET'])
 def get_global_zone_stats():
-    """Stats globales d'une zone (Nom, Top productions, Total producteurs, Volume total)"""
+    """Stats globales d'une zone (Nom, TOUTES les productions, Volume total)"""
     zone_id = request.args.get('zone_id')
+    year = request.args.get('year') # Si tu gères l'année
+    
     if not zone_id:
         return jsonify({"error": "zone_id is required"}), 400
         
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Récupérer le nom et le niveau de la zone
+        # 1. Info Zone
         cur.execute("SELECT name, level FROM administrative_zones WHERE id = %s", (int(zone_id),))
         zone_info = cur.fetchone()
 
-        # 2. Top 5 productions (Requête corrigée)
-        top_products_query = """
+        # Construction de la clause WHERE pour l'année
+        year_clause = "AND ps.year = %s" if year else ""
+        params_top = [int(zone_id)]
+        if year: params_top.append(year)
+
+        # 2. TOUTES les productions (On a retiré LIMIT 5)
+        # On a retiré producer_count
+        all_products_query = f"""
             SELECT ss.name, SUM(ps.volume) as volume, MAX(ps.unit) as unit
             FROM production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
@@ -322,16 +330,19 @@ def get_global_zone_stats():
                     JOIN zone_tree zt ON az.parent_id = zt.id::text
                 ) SELECT code FROM zone_tree
             )
+            {year_clause}
             GROUP BY ss.name
             ORDER BY volume DESC
-            LIMIT 5
         """
-        cur.execute(top_products_query, (int(zone_id),))
-        top_products = cur.fetchall()
+        cur.execute(all_products_query, params_top)
+        all_products = cur.fetchall()
 
-        # 3. Calcul du volume total et des producteurs
-        totals_query = """
-            SELECT SUM(ps.volume) as total_volume, SUM(ps.producer_count) as total_producers
+        # 3. Volume Total uniquement (Plus de producteurs)
+        params_total = [int(zone_id)]
+        if year: params_total.append(year)
+        
+        totals_query = f"""
+            SELECT SUM(ps.volume) as total_volume
             FROM production_stats ps
             WHERE ps.zone_code IN (
                 WITH RECURSIVE zone_tree AS (
@@ -341,16 +352,17 @@ def get_global_zone_stats():
                     JOIN zone_tree zt ON az.parent_id = zt.id::text
                 ) SELECT code FROM zone_tree
             )
+            {year_clause.replace('ps.', '')} -- petite astuce si ps n'est pas aliasé pareil, mais ici ok
         """
-        cur.execute(totals_query, (int(zone_id),))
+        cur.execute(totals_query, params_total)
         totals = cur.fetchone()
 
         return jsonify({
             "zone_name": zone_info['name'] if zone_info else 'N/A',
             "zone_level": zone_info['level'] if zone_info else 'N/A',
-            "top_products": top_products,
-            "total_producers": int(totals['total_producers']) if totals and totals['total_producers'] else 0,
+            "top_products": all_products, # On garde la clé "top_products" pour pas casser le frontend, mais elle contient TOUT
             "total_volume": float(totals['total_volume']) if totals and totals['total_volume'] else 0
+            # On a retiré total_producers
         })
     except Exception as e:
         app.logger.error(f"Erreur stats/global: {e}")
