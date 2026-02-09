@@ -171,7 +171,7 @@ def get_zone_stats():
                 JOIN zone_tree zt ON az.parent_id = zt.id::text
             )
             SELECT ss.name as sector, s.name as category, SUM(ps.volume) as volume, MAX(ps.unit) as unit
-            FROM production_stats ps
+            FROM mv_production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
             JOIN sectors s ON ss.sector_id = s.id
             WHERE ps.zone_code IN (SELECT code FROM zone_tree)
@@ -206,7 +206,7 @@ def get_evolution_stats():
                 JOIN zone_tree zt ON az.parent_id = zt.id::text
             )
             SELECT ps.year, ss.name as sector, s.name as category, SUM(ps.volume) as volume
-            FROM production_stats ps
+            FROM mv_production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
             JOIN sectors s ON ss.sector_id = s.id -- Jointure ajoutée
             WHERE ps.zone_code IN (SELECT code FROM zone_tree)
@@ -274,7 +274,7 @@ def get_comparison_stats():
                     SELECT az.code, az.id FROM administrative_zones az
                     JOIN zone_tree zt ON az.parent_id = zt.id::text
                 )
-                SELECT sub_sector_id FROM production_stats ps
+                SELECT sub_sector_id FROM mv_production_stats ps
                 WHERE zone_code IN (SELECT code FROM zone_tree)
                 GROUP BY sub_sector_id ORDER BY SUM(volume) DESC LIMIT 1
             """, (int(zone_id),))
@@ -290,7 +290,7 @@ def get_comparison_stats():
                         SELECT az.code, az.id FROM administrative_zones az
                         JOIN child_tree zt ON az.parent_id = zt.id::text
                     )
-                    SELECT SUM(volume) as total FROM production_stats
+                    SELECT SUM(volume) as total FROM mv_production_stats
                     WHERE sub_sector_id = %s AND zone_code IN (SELECT code FROM child_tree)
                 """, (child['id'], sid))
                 res = cur.fetchone()
@@ -329,7 +329,7 @@ def get_global_zone_stats():
         # On a retiré producer_count
         all_products_query = f"""
             SELECT ss.name, SUM(ps.volume) as volume, MAX(ps.unit) as unit
-            FROM production_stats ps
+            FROM mv_production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
             WHERE ps.zone_code IN (
                  WITH RECURSIVE zone_tree AS (
@@ -352,7 +352,7 @@ def get_global_zone_stats():
         
         totals_query = f"""
             SELECT SUM(ps.volume) as total_volume
-            FROM production_stats ps
+            FROM mv_production_stats ps
             WHERE ps.zone_code IN (
                 WITH RECURSIVE zone_tree AS (
                     SELECT code, id FROM administrative_zones WHERE id = %s
