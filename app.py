@@ -379,6 +379,34 @@ def get_global_zone_stats():
     finally:
         cur.close()
         conn.close()
+
+@app.route('/api/gis/search', methods=['GET'])
+def search_zones():
+    query = request.args.get('q', '').strip()
+    if len(query) < 2:
+        return jsonify([])
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # On cherche dans les noms, insensible à la casse
+        # On exclut le niveau PAYS car inutile à chercher
+        sql = """
+            SELECT id, name, level, parent_id 
+            FROM administrative_zones 
+            WHERE name ILIKE %s AND level != 'COUNTRY'
+            ORDER BY name ASC
+            LIMIT 10
+        """
+        search_pattern = f"%{query}%"
+        cur.execute(sql, (search_pattern,))
+        results = cur.fetchall()
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
         
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
