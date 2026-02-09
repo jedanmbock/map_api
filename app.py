@@ -191,12 +191,13 @@ def get_zone_stats():
 
 @app.route('/api/stats/evolution', methods=['GET'])
 def get_evolution_stats():
-    """Evolution temporelle pour les top produits de la zone (Toutes années confondues)"""
+    """Evolution temporelle avec métadonnées de catégorie"""
     zone_id = request.args.get('zone_id')
     
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        # On récupère aussi s.name (Catégorie)
         query = """
             WITH RECURSIVE zone_tree AS (
                 SELECT code, id FROM administrative_zones WHERE id = %s
@@ -204,38 +205,46 @@ def get_evolution_stats():
                 SELECT az.code, az.id FROM administrative_zones az
                 JOIN zone_tree zt ON az.parent_id = zt.id::text
             )
-            SELECT ps.year, ss.name as sector, SUM(ps.volume) as volume
+            SELECT ps.year, ss.name as sector, s.name as category, SUM(ps.volume) as volume
             FROM production_stats ps
             JOIN sub_sectors ss ON ps.sub_sector_id = ss.id
+            JOIN sectors s ON ss.sector_id = s.id -- Jointure ajoutée
             WHERE ps.zone_code IN (SELECT code FROM zone_tree)
-            -- SUPPRESSION DE LA RESTRICTION D'ANNÉE ICI :
-            -- AND ps.year BETWEEN 2021 AND 2024  <-- A ENLEVER
-            GROUP BY ps.year, ss.name
+            GROUP BY ps.year, ss.name, s.name
             ORDER BY ps.year ASC
         """
         cur.execute(query, (int(zone_id),))
         rows = cur.fetchall()
 
-        # Restructuration pour le frontend
         data_by_year = {}
         sectors = set()
-        
-        # On s'assure que les années sont bien des entiers
+        # Dictionnaire pour mapper Filière -> Catégorie
+        # Ex: {"Cacao": "Agriculture", "Bovins": "Elevage"}
+        categories_map = {} 
+
         for row in rows:
             year = int(row['year']) 
             if year not in data_by_year: data_by_year[year] = {"year": year}
-            data_by_year[year][row['sector']] = float(row['volume'])
-            sectors.add(row['sector'])
+            
+            sector_name = row['sector']
+            data_by_year[year][sector_name] = float(row['volume'])
+            
+            sectors.add(sector_name)
+            categories_map[sector_name] = row['category'].upper() # On normalise en MAJ
 
-        # Conversion en liste triée par année
         sorted_data = sorted(list(data_by_year.values()), key=lambda x: x['year'])
 
-        return jsonify({"data": sorted_data, "sectors": list(sectors)})
+        return jsonify({
+            "data": sorted_data, 
+            "sectors": list(sectors),
+            "categories": categories_map # On renvoie ce mapping au frontend
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
         cur.close()
         conn.close()
+        
 @app.route('/api/stats/comparison', methods=['GET'])
 def get_comparison_stats():
     """Comparaison des enfants directs (ex: Départements d'une Région)"""
